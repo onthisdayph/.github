@@ -1,0 +1,74 @@
+name: Auto-label Issues
+
+on:
+  issues:
+    types: [opened]
+
+# Minimum permissions required
+permissions:
+  issues: write
+
+# Prevent duplicate runs for the same issue
+concurrency:
+  group: label-issue-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Auto-label based on issue title prefix
+        # Pin to full SHA for supply chain security
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const title = issue.title.toLowerCase();
+            const labelsToAdd = [];
+
+            // Map title prefixes from issue templates to labels
+            if (title.startsWith('[bug]')) {
+              labelsToAdd.push('bug', 'triage');
+            } else if (title.startsWith('[feature]')) {
+              labelsToAdd.push('enhancement');
+            }
+
+            if (labelsToAdd.length === 0) {
+              console.log('No matching prefix found, skipping.');
+              return;
+            }
+
+            // Fetch existing labels on the repo to avoid errors
+            const repoLabels = await github.rest.issues.listLabelsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            const repoLabelNames = repoLabels.data.map(l => l.name);
+
+            // Only add labels that exist in the repo
+            const validLabels = labelsToAdd.filter(l => repoLabelNames.includes(l));
+
+            if (validLabels.length === 0) {
+              console.log('None of the target labels exist in the repo yet. Skipping.');
+              return;
+            }
+
+            // Get labels already on the issue so we don't duplicate
+            const existingLabels = issue.labels.map(l => l.name);
+            const newLabels = validLabels.filter(l => !existingLabels.includes(l));
+
+            if (newLabels.length === 0) {
+              console.log('All labels already present. Nothing to do.');
+              return;
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              labels: newLabels,
+            });
+
+            console.log(`Added labels: ${newLabels.join(', ')}`);

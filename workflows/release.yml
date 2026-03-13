@@ -1,0 +1,216 @@
+name: Release
+
+on:
+  # Trigger when code is pushed to the production branch (typically merged from main)
+  push:
+    branches:
+      - production
+
+  # Allow manual trigger with version bump type selection
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+# Minimum permissions required: create branches, tags, and releases
+permissions:
+  contents: write
+
+# Only one release workflow at a time
+concurrency:
+  group: release-production
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # -----------------------------------------------------------
+      # 1. Checkout the full history so we can read tags and commits
+      # -----------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: production
+          fetch-depth: 0 # full history needed for tag lookup and commit collation
+          fetch-tags: true
+
+      # -----------------------------------------------------------
+      # 2. Determine the next semantic version
+      #    - Finds the latest vX.Y.Z tag reachable from HEAD
+      #    - Bumps patch by default (push trigger) or by input (dispatch)
+      #    - Falls back to v1.0.0 when no tag exists
+      # -----------------------------------------------------------
+      - name: Compute next version
+        id: version
+        run: |
+          set -euo pipefail
+
+          # Decide bump type: from workflow_dispatch input or default to patch
+          BUMP="${{ github.event.inputs.bump || 'patch' }}"
+          echo "Bump type: ${BUMP}"
+
+          # Find the latest semver tag (vMAJOR.MINOR.PATCH) reachable from HEAD
+          LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1 || true)
+
+          if [ -z "${LATEST_TAG}" ]; then
+            echo "No existing version tag found. Starting at v1.0.0."
+            NEXT_VERSION="v1.0.0"
+            PREVIOUS_TAG=""
+          else
+            echo "Latest tag: ${LATEST_TAG}"
+            PREVIOUS_TAG="${LATEST_TAG}"
+
+            # Strip the leading 'v' and split into components
+            VERSION="${LATEST_TAG#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "${VERSION}"
+
+            case "${BUMP}" in
+              major)
+                MAJOR=$((MAJOR + 1))
+                MINOR=0
+                PATCH=0
+                ;;
+              minor)
+                MINOR=$((MINOR + 1))
+                PATCH=0
+                ;;
+              patch)
+                PATCH=$((PATCH + 1))
+                ;;
+              *)
+                echo "::error::Unknown bump type: ${BUMP}"
+                exit 1
+                ;;
+            esac
+
+            NEXT_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          fi
+
+          # Date for the release branch name
+          RELEASE_DATE=$(date -u +%Y-%m-%d)
+
+          echo "next_version=${NEXT_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "previous_tag=${PREVIOUS_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "release_date=${RELEASE_DATE}" >> "${GITHUB_OUTPUT}"
+          echo "release_branch=release/${RELEASE_DATE}_${NEXT_VERSION}" >> "${GITHUB_OUTPUT}"
+
+          echo "Next version: ${NEXT_VERSION}"
+          echo "Release branch: release/${RELEASE_DATE}_${NEXT_VERSION}"
+
+      # -----------------------------------------------------------
+      # 3. Collate commits between the previous tag and HEAD
+      #    - Lists commit hash (short), author username, and message
+      #    - Falls back to all commits if no previous tag exists
+      # -----------------------------------------------------------
+      - name: Build changelog
+        id: changelog
+        run: |
+          set -euo pipefail
+
+          PREVIOUS_TAG="${{ steps.version.outputs.previous_tag }}"
+          NEXT_VERSION="${{ steps.version.outputs.next_version }}"
+
+          if [ -z "${PREVIOUS_TAG}" ]; then
+            echo "No previous tag -- including all commits."
+            RANGE="HEAD"
+          else
+            RANGE="${PREVIOUS_TAG}..HEAD"
+          fi
+
+          # Build a markdown changelog with author and message per commit
+          # Format: - <short-sha> <message> (@<author>)
+          CHANGELOG=$(git log "${RANGE}" --pretty=format:'- %h %s (@%an)' --no-merges)
+
+          if [ -z "${CHANGELOG}" ]; then
+            CHANGELOG="No new commits since ${PREVIOUS_TAG:-the beginning}."
+          fi
+
+          # Write the full release body to a temp file to avoid shell escaping issues
+          {
+            echo "## What's Changed in ${NEXT_VERSION}"
+            echo ""
+            echo "${CHANGELOG}"
+            echo ""
+            echo "**Full diff:** https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG:-$(git rev-list --max-parents=0 HEAD | head -1)}...${NEXT_VERSION}"
+          } > /tmp/release_body.md
+
+          echo "Changelog written to /tmp/release_body.md"
+          cat /tmp/release_body.md
+
+      # -----------------------------------------------------------
+      # 4. Create the release branch from the current production HEAD
+      #    - Named release/YYYY-MM-DD_vX.Y.Z
+      # -----------------------------------------------------------
+      - name: Create release branch
+        run: |
+          set -euo pipefail
+
+          BRANCH="${{ steps.version.outputs.release_branch }}"
+
+          # Check if the branch already exists on the remote
+          if git ls-remote --exit-code --heads origin "${BRANCH}" > /dev/null 2>&1; then
+            echo "::error::Release branch '${BRANCH}' already exists. Aborting to prevent duplicate releases."
+            exit 1
+          fi
+
+          git checkout -b "${BRANCH}"
+          git push origin "${BRANCH}"
+
+          echo "Created and pushed branch: ${BRANCH}"
+
+      # -----------------------------------------------------------
+      # 5. Create the version tag on the production branch HEAD
+      # -----------------------------------------------------------
+      - name: Create version tag
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.version.outputs.next_version }}"
+
+          # Ensure tag does not already exist
+          if git rev-parse "${TAG}" > /dev/null 2>&1; then
+            echo "::error::Tag '${TAG}' already exists. Aborting."
+            exit 1
+          fi
+
+          # Tag at the production HEAD (which is also the release branch HEAD)
+          git tag "${TAG}"
+          git push origin "${TAG}"
+
+          echo "Created and pushed tag: ${TAG}"
+
+      # -----------------------------------------------------------
+      # 6. Create a GitHub Release with the changelog as release notes
+      #    - Uses the tag we just pushed
+      #    - Marks as latest release
+      # -----------------------------------------------------------
+      - name: Create GitHub Release
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('/tmp/release_body.md', 'utf8');
+            const tag = '${{ steps.version.outputs.next_version }}';
+
+            const release = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `Release ${tag}`,
+              body: body,
+              draft: false,
+              prerelease: false,
+              make_latest: 'true',
+            });
+
+            core.info(`Created release: ${release.data.html_url}`);
